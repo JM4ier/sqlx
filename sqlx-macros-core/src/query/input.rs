@@ -97,14 +97,71 @@ impl Parse for QueryMacroInput {
 
         let file_path = src.file_path(src_span)?;
 
-        Ok(QueryMacroInput {
+        QueryMacroInput {
             sql: src.resolve(src_span)?,
             src_span,
             record_type,
             arg_exprs,
             checked,
             file_path,
-        })
+        }.resolve_inline_parameters()
+    }
+}
+
+/// very simplistic way to allow inline arguments in the query macro, like
+/// let account_id = 5;
+/// sqlx::query!("select * from accounts where id = {{account_id}}")
+impl QueryMacroInput {
+    pub fn resolve_inline_parameters(mut self) -> syn::Result<Self> {
+        #[derive(Copy, Clone)]
+        enum State {
+            Sql,
+            OpenBrace1,
+            Interpolation,
+            CloseBrace1,
+        }
+
+        let mut sql = String::with_capacity(self.sql.len());
+        let mut interpolation = String::new();
+        let mut state = State::Sql;
+
+        for ch in self.sql.chars() {
+            match (ch, state) {
+                ('{', State::Sql) => state = State::OpenBrace1,
+                (ch, State::Sql) => {
+                    sql.push(ch);
+                }
+                ('{', State::OpenBrace1) => state = State::Interpolation,
+                (ch, State::OpenBrace1) => {
+                    sql.push('{');
+                    sql.push(ch);
+                    state = State::Sql;
+                }
+                ('}', State::Interpolation) => state = State::CloseBrace1,
+                (ch, State::Interpolation) => {
+                    interpolation.push(ch);
+                }
+                ('}', State::CloseBrace1) => {
+                    sql += "$";
+                    sql += &(self.arg_exprs.len() + 1).to_string();
+                    let tokens: proc_macro2::TokenStream = interpolation.parse()?; // todo fix lost span
+                    let expr: Expr = syn::parse(tokens.into())?;
+                    self.arg_exprs.push(expr);
+                    interpolation.clear();
+                    state = State::Sql;
+                }
+                (ch, State::CloseBrace1) => {
+                    interpolation.push('}');
+                    interpolation.push(ch);
+                    state = State::Interpolation;
+                }
+            }
+        }
+
+        assert!(matches!(state, State::Sql));
+
+        self.sql = sql;
+        Ok(self)
     }
 }
 
